@@ -1,0 +1,355 @@
+<!doctype html> 
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Crossy Road 3D - WASD Fix</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{
+    font-family: Inter, Arial, sans-serif;
+    background: linear-gradient(#8ec5fc,#e0c3fc);
+    overflow:hidden;
+  }
+  #overlay{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:linear-gradient(to br, rgba(0,0,0,0.6), rgba(0,0,30,0.6));
+    color:#fff;z-index:50;flex-direction:column;gap:16px;
+  }
+  #overlay h1{font-size:44px;margin:0;color:#ffd24d;text-shadow:0 6px 20px rgba(0,0,0,.5)}
+  #overlay p{max-width:720px;text-align:center;margin:0;line-height:1.4}
+  #startBtn{cursor:pointer;background:linear-gradient(90deg,#ffb84d,#ffdf80);border:none;padding:12px 28px;border-radius:24px;font-size:18px;font-weight:700;box-shadow:0 8px 30px rgba(0,0,0,.35)}
+  #hud{position:fixed;top:12px;left:12px;z-index:40;color:#fff;background:rgba(0,0,0,.35);padding:8px 12px;border-radius:8px;font-weight:600;display:none}
+  #hint{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);z-index:40;color:#fff;background:rgba(0,0,0,.35);padding:8px 12px;border-radius:8px;display:none}
+  canvas{display:block}
+</style>
+</head>
+<body>
+  <div id="overlay">
+    <h1>CROSSY ROAD 3D</h1>
+    <p>
+      Reglas: Empiezas en zona segura. Usa <strong>W A S D</strong> — cada pulsación da un paso (no mantener).<br>
+      Cruza las calles horizontales, evita los autos con velocidades variables. Si te atropellan, reinicias.
+    </p>
+    <button id="startBtn">JUGAR</button>
+  </div>
+
+  <div id="hud">
+    Distancia: <span id="dist">0</span> &nbsp; • &nbsp; Vidas: <span id="lives">3</span>
+  </div>
+  <div id="hint">W/A/S/D — paso por paso</div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/fflate@0.7.4/umd/index.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/FBXLoader.js"></script>
+
+<script>
+(() => {
+  // --- CONFIG ---
+  const MODELS_PATH = "Models/";
+  const STEP = 4; // tamaño del paso
+  const SEG_LEN = 12;
+  const LANE_W = 3.5;
+  const SEGMENTS_AHEAD = 12;
+  const MAX_SEGMENTS = 40;
+  const START_LIVES = 3;
+
+  // --- STATE ---
+  let renderer, scene, camera, clock;
+  let actions = {};
+  let mixerList = [];
+  let player = null;
+  let currentAction = null;
+  let isMoving = false;
+  let clickAllowed = false;
+  let distance = 0;
+  let lives = START_LIVES;
+
+  const segments = [];
+  const obstacles = [];
+  const colors = [0xff6b6b, 0x6bff8b, 0x6ba3ff, 0xffd26b];
+
+  const overlay = document.getElementById("overlay");
+  const startBtn = document.getElementById("startBtn");
+  const hud = document.getElementById("hud");
+  const distEl = document.getElementById("dist");
+  const livesEl = document.getElementById("lives");
+  const hint = document.getElementById("hint");
+
+  startBtn.addEventListener("click", startGame);
+
+  function startGame(){
+    overlay.style.display = "none";
+    hud.style.display = "block";
+    hint.style.display = "block";
+    setupScene();
+    generateInitialSegments();
+    loadFBXs(() => {
+      setPlayerAction("idle");
+      enableKeyboard();
+      animate();
+    });
+  }
+
+  function setupScene(){
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+    clock = new THREE.Clock();
+
+    camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+    camera.position.set(0, 6, -12);
+
+    renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+    hemi.position.set(0,200,0); scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(50,80,10); scene.add(dir);
+
+    window.addEventListener("resize", onResize);
+  }
+
+  function onResize(){
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  }
+
+  // --- SEGMENTS ---
+  function addSafeSegment(z){
+    const geo = new THREE.BoxGeometry(SEG_LEN, 0.12, 12);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x6fbf73 });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set(0,0,z);
+    scene.add(m);
+    segments.push(m);
+    maybeTrimSegments();
+  }
+
+  function addRoadSegment(z){
+    const lanes = 2 + Math.floor(Math.random()*4);
+    const totalW = lanes * LANE_W;
+    const geo = new THREE.BoxGeometry(SEG_LEN, 0.12, totalW);
+    const mat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+    const road = new THREE.Mesh(geo, mat);
+    road.position.set(0,0,z);
+    scene.add(road);
+    segments.push(road);
+
+    for(let i=1;i<lanes;i++){
+      const ln = new THREE.Mesh(new THREE.BoxGeometry(SEG_LEN,0.02,0.08),
+         new THREE.MeshStandardMaterial({ color:0xffffff }));
+      ln.position.set(0,0.06,z - totalW/2 + i*LANE_W);
+      scene.add(ln);
+    }
+
+    for(let lane=0; lane<lanes; lane++){
+      if (Math.random() < 0.65){
+        const car = new THREE.Mesh(
+          new THREE.BoxGeometry(2.4,1.0,1.8),
+          new THREE.MeshStandardMaterial({ color: colors[Math.floor(Math.random()*colors.length)] })
+        );
+        car.position.set((Math.random()-0.5)*SEG_LEN*0.8, 0.5, z - totalW/2 + lane*LANE_W + LANE_W/2);
+        scene.add(car);
+        const dir = Math.random() > 0.5 ? 1 : -1;
+        const speed = 1.0 + Math.random()*2.5;
+        obstacles.push({ mesh:car, speed, dir, laneZ:car.position.z });
+      }
+    }
+    maybeTrimSegments();
+  }
+
+  function maybeTrimSegments(){
+    if (segments.length > MAX_SEGMENTS){
+      const rem = segments.splice(0, segments.length - MAX_SEGMENTS);
+      rem.forEach(s => scene.remove(s));
+    }
+    if (player){
+      for(let i = obstacles.length-1; i>=0; i--){
+        if (obstacles[i].mesh.position.z < player.position.z - 60){
+          scene.remove(obstacles[i].mesh);
+          obstacles.splice(i,1);
+        }
+      }
+    }
+  }
+
+  function generateInitialSegments(){
+    addSafeSegment(0);
+    for(let i=1;i<=SEGMENTS_AHEAD;i++){
+      if (i%2===1) addRoadSegment(i*12);
+      else addSafeSegment(i*12);
+    }
+  }
+
+  // --- FBX LOAD ---
+  function loadFBXs(onDone){
+    const loader = new THREE.FBXLoader();
+    let loaded = 0, total = 3;
+    const checkDone = () => (++loaded === total && onDone());
+
+    loader.load(MODELS_PATH + "reposo.fbx", fbx => { prepareFBX(fbx,"idle"); checkDone(); }, undefined, ()=>{createFallback("idle");checkDone();});
+    loader.load(MODELS_PATH + "correr.fbx", fbx => { prepareFBX(fbx,"run"); checkDone(); }, undefined, ()=>{createFallback("run");checkDone();});
+    loader.load(MODELS_PATH + "muerte.fbx", fbx => { prepareFBX(fbx,"die"); checkDone(); }, undefined, ()=>{createFallback("die");checkDone();});
+  }
+
+  function prepareFBX(fbx, slot){
+    fbx.scale.setScalar(0.01);
+    fbx.position.set(0,0,0);
+    fbx.traverse(c => { if(c.isMesh){ c.castShadow=true; c.receiveShadow=true; }});
+    const mixer = new THREE.AnimationMixer(fbx);
+    mixerList.push(mixer);
+    let action = fbx.animations.length>0 ? mixer.clipAction(fbx.animations[0]) : null;
+    actions[slot] = { model: fbx, mixer, action };
+    fbx.visible = (slot === "idle");
+    scene.add(fbx);
+    if (!player && slot === "idle") player = fbx;
+  }
+
+  function createFallback(slot){
+    const geo = new THREE.BoxGeometry(1,2,1);
+    const mat = new THREE.MeshStandardMaterial({ color: slot==="idle"?0xffff66: slot==="run"?0x66ff66:0xff6666 });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(0,1,0);
+    actions[slot] = { model: mesh, mixer: null, action: null };
+    mesh.visible = (slot==="idle");
+    scene.add(mesh);
+    if(!player) player = mesh;
+  }
+
+  function setPlayerAction(slot){
+    for(const k in actions){ if(actions[k] && actions[k].model) actions[k].model.visible = false; }
+    const s = actions[slot];
+    if(!s) return;
+    s.model.visible = true;
+    player = s.model;
+    if(s.action && s.mixer){
+      for(const k in actions){ if(actions[k] && actions[k].action) actions[k].action.stop(); }
+      s.action.reset().play();
+    }
+    currentAction = slot;
+  }
+
+  // --- CONTROLES ---
+  function enableKeyboard(){
+    clickAllowed = true;
+    updateHUD();
+    window.addEventListener("keydown", onKeyDown);
+  }
+
+  function onKeyDown(e){
+    if(!clickAllowed || isMoving || e.repeat) return;
+    const key = e.key.toLowerCase();
+    let dir = null;
+    if(key==="w") dir = new THREE.Vector3(0,0,STEP);
+    else if(key==="s") dir = new THREE.Vector3(0,0,-STEP);
+    else if(key==="a") dir = new THREE.Vector3(-STEP,0,0);
+    else if(key==="d") dir = new THREE.Vector3(STEP,0,0);
+    else return;
+
+    const target = player.position.clone().add(dir);
+    const angle = Math.atan2(dir.x, dir.z);
+    player.rotation.y = angle;
+    movePlayerTo(target, () => {
+      if (dir.z > 0) { distance++; updateHUD(); }
+      const lastZ = segments[segments.length-1].position.z;
+      if (player.position.z + SEG_LEN*SEGMENTS_AHEAD > lastZ) {
+        for(let i=1;i<=3;i++){
+          const z = lastZ + i*SEG_LEN;
+          Math.random()>0.5 ? addRoadSegment(z) : addSafeSegment(z);
+        }
+      }
+    });
+  }
+
+  function movePlayerTo(target, onComplete){
+    isMoving = true;
+    setPlayerAction("run");
+    const duration = 200; // ms
+    const start = player.position.clone();
+    const t0 = performance.now();
+    function step(now){
+      const t = (now - t0) / duration;
+      const clamp = t>1?1:t;
+      player.position.lerpVectors(start, target, clamp);
+      if (clamp < 1) requestAnimationFrame(step);
+      else {
+        setPlayerAction("idle");
+        isMoving = false;
+        checkCollisions();
+        onComplete && onComplete();
+      }
+    }
+    requestAnimationFrame(step);
+  }
+
+  // --- COLISIONES ---
+  function checkCollisions(){
+    if(!player) return;
+    const pBox = new THREE.Box3().setFromObject(player);
+    for(const o of obstacles){
+      const b = new THREE.Box3().setFromObject(o.mesh);
+      if(pBox.intersectsBox(b)){
+        lives--;
+        updateHUD();
+        setPlayerAction("die");
+        setTimeout(()=>{
+          resetPosition();
+          if(lives<=0){
+            alert("Game Over — Reiniciando partida");
+            resetAll();
+          }
+        },800);
+        return;
+      }
+    }
+  }
+
+  function resetPosition(){
+    for(const k in actions){ if(actions[k] && actions[k].model) actions[k].model.position.set(0,0,0); }
+    setPlayerAction("idle");
+    distance = 0; updateHUD();
+  }
+
+  function resetAll(){
+    segments.forEach(s => scene.remove(s));
+    obstacles.forEach(o => scene.remove(o.mesh));
+    segments.length=0; obstacles.length=0;
+    generateInitialSegments();
+    distance=0; lives=START_LIVES; updateHUD();
+    resetPosition();
+  }
+
+  function updateHUD(){
+    distEl.textContent = distance;
+    livesEl.textContent = lives;
+  }
+
+  // --- LOOP ---
+  function animate(){
+    requestAnimationFrame(animate);
+    const dt = clock.getDelta();
+    mixerList.forEach(m => m.update(dt));
+
+    for(const o of obstacles){
+      o.mesh.position.x += o.dir * o.speed * dt;
+      const limit = SEG_LEN/2 + 8;
+      if(o.mesh.position.x > limit) o.mesh.position.x = -limit;
+      if(o.mesh.position.x < -limit) o.mesh.position.x = limit;
+    }
+
+    if(player){
+      const camOffset = new THREE.Vector3(0, 6, -10);
+      const camPos = player.position.clone().add(camOffset);
+      camera.position.lerp(camPos, 0.1);
+      camera.lookAt(player.position.x, player.position.y + 1.5, player.position.z + 5);
+    }
+
+    renderer.render(scene, camera);
+  }
+
+})();
+</script>
+</body>
+</html>
